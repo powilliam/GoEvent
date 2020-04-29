@@ -2,20 +2,14 @@ package main
 
 import (
 	"context"
-	"log"
-	"time"
+	"fmt"
 
 	"github.com/gofiber/fiber"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
-
-// MongoInstance contains MongoDB client and database
-type MongoInstance struct {
-	Client *mongo.Client
-	Db     *mongo.Database
-}
 
 // EventDate contains the year, month and day of an event
 type EventDate struct {
@@ -32,89 +26,156 @@ type Event struct {
 	Date     EventDate `json:"date"`
 }
 
-var mg MongoInstance
+func createConnection() *mongo.Database {
+	connectionOptions := options.Client()
+	connectionOptions.ApplyURI("mongodb://localhost:27017")
 
-// Connect to MongoDB
-func Connect() error {
-	client, err := mongo.NewClient(options.Client().ApplyURI("mongodb+srv://customuser:customuser@heaven-uc9c7.mongodb.net"))
+	client, err := mongo.Connect(context.TODO(), connectionOptions)
 	if err != nil {
-		return err
+		defer client.Disconnect(context.TODO())
+		panic(err)
+	} else {
+		fmt.Println("> Database is connected")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	err = client.Connect(ctx)
-	db := client.Database("GoEvent")
-
-	if err != nil {
-		return err
+	if err := client.Ping(context.TODO(), nil); err != nil {
+		defer client.Disconnect(context.TODO())
+		panic(err)
+	} else {
+		fmt.Println("> MongoDB client is working as desired")
 	}
 
-	mg = MongoInstance{
-		Client: client,
-		Db:     db,
-	}
-
-	return nil
+	return client.Database("GoEvent")
 }
 
 func main() {
-	if err := Connect(); err != nil {
-		log.Fatal(err)
-	}
+	database := createConnection()
 
-	app := fiber.New()
-	app.Settings.CaseSensitive = true
-	app.Settings.StrictRouting = true
+	appSettings := &fiber.Settings{
+		CaseSensitive: true,
+		StrictRouting: true,
+	}
+	app := fiber.New(appSettings)
 
 	app.Get("/events", func(c *fiber.Ctx) {
-		cursor, err := mg.Db.Collection("events").Find(context.TODO(), bson.D{{}})
+		filter := bson.D{{}}
+		cursor, err := database.Collection("events").Find(context.TODO(), filter)
 		if err != nil {
-			c.Status(500).JSON(err)
+			c.Status(500).JSON(fiber.Map{
+				"error": err,
+			})
 			return
 		}
 
-		var events []Event = make([]Event, 0)
+		events := make([]Event, 0)
 		if err := cursor.All(context.TODO(), &events); err != nil {
-			c.Status(500).JSON(err)
+			c.Status(500).JSON(fiber.Map{
+				"error": err,
+			})
 			return
 		}
 
-		if err := c.JSON(events); err != nil {
-			c.Status(500).JSON(err)
+		if err := c.Status(200).JSON(events); err != nil {
+			c.Status(500).JSON(fiber.Map{
+				"error": err,
+			})
 			return
 		}
 	})
 
 	app.Post("/events", func(c *fiber.Ctx) {
-		collection := mg.Db.Collection("events")
-
-		event := new(Event)
+		event := &Event{}
 
 		if err := c.BodyParser(event); err != nil {
-			c.Status(400).JSON(err)
+			c.Status(400).JSON(fiber.Map{
+				"error": err,
+			})
+			return
 		}
 
-		event.ID = ""
-
-		insertedEvent, err := collection.InsertOne(context.TODO(), event)
+		insertionResult, err := database.Collection("events").InsertOne(context.TODO(), &event)
 		if err != nil {
-			c.Status(500).JSON(err)
+			c.Status(500).JSON(fiber.Map{
+				"error": err,
+			})
 			return
 		}
 
-		filter := bson.D{{Key: "_id", Value: insertedEvent.InsertedID}}
-
-		searchedEvent := collection.FindOne(context.TODO(), filter)
-
-		createdEvent := &Event{}
-		searchedEvent.Decode(createdEvent)
-
-		if err := c.Status(201).JSON(createdEvent); err != nil {
-			c.Status(500).JSON(err)
+		filter := bson.D{{Key: "_id", Value: insertionResult.InsertedID}}
+		if err := database.Collection("events").FindOne(context.TODO(), filter).Decode(&event); err != nil {
+			c.Status(400).JSON(fiber.Map{
+				"error": err,
+			})
 			return
 		}
+
+		if err := c.Status(201).JSON(event); err != nil {
+			c.Status(400).JSON(fiber.Map{
+				"error": err,
+			})
+			return
+		}
+	})
+
+	app.Put("/events/:id", func(c *fiber.Ctx) {
+		event := &Event{}
+
+		eventID, err := primitive.ObjectIDFromHex(
+			c.Params("id"),
+		)
+		if err != nil {
+			c.Status(400).JSON(fiber.Map{
+				"error": err,
+			})
+			return
+		}
+
+		if err := c.BodyParser(event); err != nil {
+			c.Status(400).JSON(fiber.Map{
+				"error": err,
+			})
+			return
+		}
+
+		filter := bson.D{{Key: "_id", Value: eventID}}
+		update := bson.D{{"$set", &event}}
+		if _, err := database.Collection("events").UpdateOne(context.TODO(), filter, update); err != nil {
+			c.Status(500).JSON(fiber.Map{
+				"error": err,
+			})
+			return
+		}
+
+		if err := database.Collection("events").FindOne(context.TODO(), filter).Decode(&event); err != nil {
+			c.Status(500).JSON(fiber.Map{
+				"error": err,
+			})
+			return
+		}
+
+		if err := c.Status(200).JSON(event); err != nil {
+			c.Status(400).JSON(fiber.Map{
+				"error": err,
+			})
+			return
+		}
+	})
+
+	app.Delete("/events/:id", func(c *fiber.Ctx) {
+		eventID, err := primitive.ObjectIDFromHex(
+			c.Params("id"),
+		)
+		if err != nil {
+			c.Status(400).JSON(fiber.Map{
+				"error": err,
+			})
+			return
+		}
+
+		filter := bson.D{{Key: "_id", Value: eventID}}
+		database.Collection("events").FindOneAndDelete(context.TODO(), filter)
+
+		c.Status(204)
 	})
 
 	app.Listen(3000)
